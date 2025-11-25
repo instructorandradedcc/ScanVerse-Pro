@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>ScanVerse | Real CV Processing</title>
+    <title>ScanVerse AI | Depth & Photogrammetry</title>
     
     <!-- React & ReactDOM -->
     <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
@@ -19,7 +19,10 @@
             theme: {
                 extend: {
                     height: {
-                        'dvh': '100dvh', // Altura dinámica para móviles
+                        'dvh': '100dvh',
+                    },
+                    animation: {
+                        'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
                     }
                 }
             }
@@ -33,25 +36,49 @@
     <!-- Lucide Icons -->
     <script src="https://unpkg.com/lucide@latest"></script>
 
-    <!-- OpenCV.js -->
+    <!-- OpenCV.js (Para el modo Nube de Puntos) -->
     <script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="window.cvLoaded=true"></script>
 
     <style>
-        body { margin: 0; overflow: hidden; background-color: #0f172a; font-family: 'Inter', sans-serif; }
-        canvas { display: block; }
+        body { margin: 0; overflow: hidden; background-color: #020617; font-family: 'Inter', sans-serif; color: white; }
+        canvas { display: block; outline: none; }
         .lidar-grid {
-            background-image: linear-gradient(rgba(0, 255, 170, 0.1) 1px, transparent 1px),
-            linear-gradient(90deg, rgba(0, 255, 170, 0.1) 1px, transparent 1px);
-            background-size: 40px 40px;
+            background-image: linear-gradient(rgba(0, 255, 170, 0.05) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(0, 255, 170, 0.05) 1px, transparent 1px);
+            background-size: 50px 50px;
         }
         .scanner-line {
-            position: absolute; left: 0; width: 100%; height: 2px; background: #00ffaa;
-            box-shadow: 0 0 10px #00ffaa; animation: scanline 3s linear infinite;
+            position: absolute; left: 0; width: 100%; height: 2px; background: #10b981;
+            box-shadow: 0 0 15px #10b981; animation: scanline 2.5s cubic-bezier(0.4, 0, 0.2, 1) infinite;
         }
         @keyframes scanline { 0% { top: 0%; opacity: 0; } 10% { opacity: 1; } 90% { opacity: 1; } 100% { top: 100%; opacity: 0; } }
-        /* Fix para navegadores móviles */
-        .h-safe-dvh { height: 100dvh; height: 100vh; }
-        @supports (height: 100dvh) { .h-safe-dvh { height: 100dvh; } }
+        .h-safe-dvh { height: 100dvh; }
+        
+        /* Loader de IA */
+        .ai-loader {
+            width: 48px;
+            height: 48px;
+            border: 3px solid #FFF;
+            border-radius: 50%;
+            display: inline-block;
+            position: relative;
+            box-sizing: border-box;
+            animation: rotation 1s linear infinite;
+        }
+        .ai-loader::after {
+            content: '';  
+            box-sizing: border-box;
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            border: 3px solid transparent;
+            border-bottom-color: #10b981;
+        }
+        @keyframes rotation { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
@@ -61,113 +88,100 @@
 <script type="text/babel">
 
 const { useState, useEffect, useRef } = React;
-const APP_VERSION = "1.01";
+const APP_VERSION = "1.02";
 
-// --- UTILS: Computer Vision Mejorado ---
+// --- UTILS: IA & Computer Vision ---
 
-const processImageToPoints = async (imgElement, index, totalImages) => {
+// 1. MODO IA (Single Image -> Depth Mesh)
+// Usa Transformers.js para correr una red neuronal real en el navegador
+const runDepthEstimation = async (imageUrl, updateStatus) => {
+    try {
+        updateStatus("Cargando Motor Neural (30MB)...");
+        
+        // Importación Dinámica de la librería de IA
+        const { pipeline, env } = await import('https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/dist/transformers.min.js');
+        
+        // Configuración para forzar descarga remota la primera vez
+        env.allowLocalModels = false;
+        env.useBrowserCache = true;
+
+        // Cargar modelo 'Depth Anything' (Versión pequeña optimizada para web)
+        const depther = await pipeline('depth-estimation', 'Xenova/depth-anything-small-hf', {
+            progress_callback: (d) => {
+                if(d.status === 'progress') updateStatus(`Descargando IA: ${Math.round(d.progress)}%`);
+            }
+        });
+
+        updateStatus("Calculando Geometría 3D...");
+        const result = await depther(imageUrl);
+        
+        // El resultado es un tensor/imagen de profundidad. Necesitamos convertirlo a datos usables.
+        // result.depth es una imagen raw.
+        
+        return { type: 'mesh', data: result.depth, originalUrl: imageUrl };
+
+    } catch (e) {
+        console.error("Error IA:", e);
+        updateStatus("Error: Navegador no soporta WebGPU/WASM.");
+        return null;
+    }
+};
+
+// 2. MODO CV (Multi Image -> Point Cloud)
+const processMultiImageCV = async (imgElements, updateStatus) => {
     return new Promise((resolve) => {
-        if (!window.cv || !window.cvLoaded) {
-            resolve([]); 
-            return;
-        }
+        if (!window.cv || !window.cvLoaded) { resolve({ type: 'cloud', points: [] }); return; }
 
-        const src = cv.imread(imgElement);
-        // Reducir tamaño interno para procesar más rápido si la imagen es gigante
-        const maxDim = 800;
-        let scale = 1;
-        if(src.cols > maxDim || src.rows > maxDim) {
-             scale = maxDim / Math.max(src.cols, src.rows);
-             const dsize = new cv.Size(src.cols * scale, src.rows * scale);
-             cv.resize(src, src, dsize, 0, 0, cv.INTER_AREA);
-        }
-
-        const width = src.cols;
-        const height = src.rows;
         const points = [];
+        const totalImages = imgElements.length;
         
-        // --- LÓGICA DE PROYECCIÓN ADAPTATIVA ---
-        // Si es 1 foto: Proyección Cónica (90 grados) para perspectiva
-        // Si son varias: Proyección Cilíndrica (360 grados) para entorno
-        const isSingleImage = totalImages === 1;
+        imgElements.forEach((img, index) => {
+            updateStatus(`Procesando foto ${index + 1}/${totalImages}...`);
+            
+            const src = cv.imread(img);
+            const maxDim = 600; // Reducir para velocidad
+            if(src.cols > maxDim) {
+                 const dsize = new cv.Size(maxDim, src.rows * (maxDim/src.cols));
+                 cv.resize(src, src, dsize, 0, 0, cv.INTER_AREA);
+            }
+
+            const width = src.cols;
+            const height = src.rows;
+            const gridStep = 8; // Alta densidad
+
+            // Proyección Cilíndrica (Panorama)
+            const anglePerImage = (Math.PI * 2) / totalImages;
+            const baseAngle = index * anglePerImage;
+            const fov = Math.PI / 2.5;
+            const radius = 4.0;
+
+            for (let y = 0; y < height; y += gridStep) {
+                for (let x = 0; x < width; x += gridStep) {
+                    const pixel = src.ucharPtr(y, x);
+                    
+                    const u = x / width;
+                    const theta = baseAngle - (u * fov) + Math.PI;
+                    const v = (y / height) - 0.5;
+                    const h = -v * 4;
+
+                    // Añadir un poco de ruido basado en brillo para simular textura 3D en la nube
+                    const brightness = (pixel[0] + pixel[1] + pixel[2]) / 765;
+                    const depthVariance = brightness * 0.1; 
+
+                    points.push({
+                        pos: [
+                            radius * Math.sin(theta) * (1 + depthVariance), 
+                            h, 
+                            radius * Math.cos(theta) * (1 + depthVariance)
+                        ],
+                        color: [pixel[0]/255, pixel[1]/255, pixel[2]/255]
+                    });
+                }
+            }
+            src.delete();
+        });
         
-        // Radio de proyección
-        const radius = 4.5; 
-
-        // Función auxiliar para calcular posición 3D
-        const calculate3DPos = (u, v) => {
-            let theta, h;
-            
-            if (isSingleImage) {
-                // Modo Foto Única: Proyectar en un arco de 90 grados frente al usuario
-                const fov = Math.PI / 2; // 90 grados
-                // Centrar el ángulo: u va de 0 a 1 -> mapear a -45 a +45 grados
-                theta = (u - 0.5) * fov + Math.PI; 
-                
-                // Altura estándar
-                h = -(v - 0.5) * 4;
-            } else {
-                // Modo Panorama: Cilindro completo 360
-                const anglePerImage = (Math.PI * 2) / totalImages;
-                const baseAngle = index * anglePerImage;
-                // FOV por imagen (asumimos solapamiento, aprox 60 grados por foto)
-                const imageFov = Math.PI / 2.5; 
-                
-                theta = baseAngle - (u * imageFov) + Math.PI;
-                h = -(v - 0.5) * 4;
-            }
-
-            const pX = radius * Math.sin(theta);
-            const pZ = radius * Math.cos(theta);
-            const pY = h;
-            
-            return { x: pX, y: pY, z: pZ };
-        };
-
-        const gridStep = 12; // Muestreo denso
-        const addPoint = (x, y, r, g, b) => {
-             const u = x / width; 
-             const v = y / height;
-             
-             const pos = calculate3DPos(u, v);
-
-             // Ruido de profundidad para dar textura 3D
-             const depthNoise = (Math.random() - 0.5) * 0.15; 
-
-             points.push({
-                pos: [pos.x * (1 + depthNoise), pos.y, pos.z * (1 + depthNoise)],
-                color: [r/255, g/255, b/255]
-             });
-        };
-
-        // 1. Muestreo Regular (Grid)
-        for (let y = 0; y < height; y += gridStep) {
-            for (let x = 0; x < width; x += gridStep) {
-                const pixel = src.ucharPtr(y, x);
-                addPoint(x, y, pixel[0], pixel[1], pixel[2]);
-            }
-        }
-
-        // 2. Detección de Detalles (ORB) para bordes nítidos
-        const gray = new cv.Mat();
-        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
-        const orb = new cv.ORB(1500); 
-        const keypoints = new cv.KeyPointVector();
-        const descriptors = new cv.Mat();
-        orb.detectAndCompute(gray, new cv.Mat(), keypoints, descriptors);
-
-        for (let i = 0; i < keypoints.size(); i++) {
-            const kp = keypoints.get(i);
-            const x = Math.floor(kp.pt.x);
-            const y = Math.floor(kp.pt.y);
-            if(x < width && y < height) {
-                const pixel = src.ucharPtr(y, x);
-                addPoint(x, y, pixel[0], pixel[1], pixel[2]);
-            }
-        }
-
-        src.delete(); gray.delete(); orb.delete(); keypoints.delete(); descriptors.delete();
-        resolve(points);
+        resolve({ type: 'cloud', points: points });
     });
 };
 
@@ -176,215 +190,136 @@ const Icon = ({ name, size = 24, className }) => {
     return <i data-lucide={name} width={size} height={size} className={className}></i>;
 };
 
-// Pantalla 1: Inicio (Modificada con Versión y Upload)
+// --- PANTALLAS ---
+
 const HomeScreen = ({ onStartCamera, onUpload }) => {
     const fileInputRef = useRef(null);
 
     const handleFileSelect = (e) => {
         const files = Array.from(e.target.files);
         if (files.length > 0) {
-            // Convertir archivos a Data URLs
-            Promise.all(files.map(file => new Promise((resolve) => {
-                const reader = new FileReader();
-                reader.onload = (e) => resolve(e.target.result);
-                reader.readAsDataURL(file);
-            }))).then(images => {
-                onUpload(images);
-            });
+            onUpload(files); // Pasamos el array de archivos directamente
         }
     };
 
     return (
-        <div className="h-safe-dvh w-full flex flex-col items-center justify-center bg-slate-900 text-white p-6 relative overflow-hidden">
-            <div className="absolute inset-0 lidar-grid opacity-20 pointer-events-none"></div>
+        <div className="h-safe-dvh w-full flex flex-col items-center justify-center bg-slate-950 text-white p-6 relative overflow-hidden">
+            <div className="absolute inset-0 lidar-grid opacity-30 pointer-events-none"></div>
             
-            {/* Versión Badge */}
-            <div className="absolute top-4 right-4 bg-slate-800/50 backdrop-blur px-3 py-1 rounded-full border border-slate-700">
-                <span className="text-xs font-mono text-emerald-400">v{APP_VERSION}</span>
+            {/* Version Badge */}
+            <div className="absolute top-4 right-4 flex items-center gap-2">
+                <a href="https://github.com/xenova/transformers.js" target="_blank" className="text-[10px] text-slate-500 hover:text-white underline">Powered by Transformers.js</a>
+                <div className="bg-emerald-900/50 backdrop-blur px-3 py-1 rounded-full border border-emerald-500/30">
+                    <span className="text-xs font-mono text-emerald-400">v{APP_VERSION}</span>
+                </div>
             </div>
 
-            <div className="z-10 text-center max-w-md w-full">
-                <div className="w-24 h-24 bg-emerald-500/10 rounded-full flex items-center justify-center ring-1 ring-emerald-500/50 mx-auto mb-6">
-                    <Icon name="scan-face" size={48} className="text-emerald-400" />
+            <div className="z-10 text-center max-w-md w-full animate-fade-in-up">
+                <div className="w-24 h-24 bg-emerald-500/10 rounded-full flex items-center justify-center ring-1 ring-emerald-500/50 mx-auto mb-6 relative">
+                    <div className="absolute inset-0 rounded-full border-t-2 border-emerald-500 animate-spin"></div>
+                    <Icon name="box" size={40} className="text-emerald-400" />
                 </div>
-                <h1 className="text-4xl font-bold mb-2 bg-clip-text text-transparent bg-gradient-to-r from-emerald-400 to-blue-500">ScanVerse Pro</h1>
-                <p className="text-slate-400 mb-8 text-sm">Escaneo Denso Híbrido & Modelado 3D.<br/>Captura paredes o visualiza planos.</p>
                 
-                <div className="space-y-3 w-full">
-                    <button onClick={onStartCamera} className="w-full py-4 bg-emerald-600 hover:bg-emerald-500 rounded-xl font-bold shadow-lg shadow-emerald-900/50 transition flex items-center justify-center gap-2">
-                        <Icon name="camera" size={20} /> INICIAR CÁMARA
-                    </button>
+                <h1 className="text-5xl font-bold mb-2 bg-clip-text text-transparent bg-gradient-to-r from-emerald-400 via-teal-300 to-cyan-400">ScanVerse</h1>
+                <p className="text-slate-400 mb-8 text-sm px-4">
+                    IA Generativa 3D en tu navegador.<br/>
+                    <span className="text-emerald-500 font-bold">1 Foto = Modelo 3D Sólido</span><br/>
+                    <span className="text-cyan-500 font-bold">Varias Fotos = Nube de Puntos</span>
+                </p>
+                
+                <div className="space-y-4 w-full px-4">
+                    <div className="relative group">
+                        <div className="absolute -inset-0.5 bg-gradient-to-r from-emerald-600 to-cyan-600 rounded-xl blur opacity-30 group-hover:opacity-75 transition duration-200"></div>
+                        <button onClick={onStartCamera} className="relative w-full py-4 bg-slate-900 hover:bg-slate-800 rounded-xl font-bold transition flex items-center justify-center gap-3 border border-slate-700">
+                            <Icon name="scan" size={20} className="text-cyan-400"/> 
+                            <span>Escanear Entorno (360°)</span>
+                        </button>
+                    </div>
                     
-                    <div className="relative">
-                        <input 
-                            type="file" 
-                            multiple 
-                            accept="image/*" 
-                            ref={fileInputRef} 
-                            onChange={handleFileSelect}
-                            className="hidden" 
-                        />
+                    <div className="relative group">
+                         <div className="absolute -inset-0.5 bg-gradient-to-r from-purple-600 to-pink-600 rounded-xl blur opacity-30 group-hover:opacity-75 transition duration-200"></div>
+                        <input type="file" multiple accept="image/*" ref={fileInputRef} onChange={handleFileSelect} className="hidden" />
                         <button 
                             onClick={() => fileInputRef.current.click()}
-                            className="w-full py-4 bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded-xl font-semibold transition flex items-center justify-center gap-2"
+                            className="relative w-full py-4 bg-slate-900 hover:bg-slate-800 rounded-xl font-bold transition flex items-center justify-center gap-3 border border-slate-700"
                         >
-                            <Icon name="upload" size={20} /> SUBIR IMAGEN / FOTOS
+                            <Icon name="image-plus" size={20} className="text-purple-400"/> 
+                            <span>Subir Foto (Generar 3D)</span>
                         </button>
                     </div>
                 </div>
             </div>
+        </div>
+    );
+};
+
+// Pantalla Procesamiento (Híbrida)
+const ProcessingScreen = ({ inputFiles, onComplete, onBack }) => {
+    const [status, setStatus] = useState("Iniciando...");
+    const [progress, setProgress] = useState(0);
+    const [preview, setPreview] = useState(null);
+
+    useEffect(() => {
+        const process = async () => {
+            // Generar preview
+            const url = URL.createObjectURL(inputFiles[0]);
+            setPreview(url);
+
+            if (inputFiles.length === 1) {
+                // --- MODO 1: SINGLE IMAGE AI ---
+                setStatus("Inicializando IA Neural...");
+                // Esperar un momento para render UI
+                await new Promise(r => setTimeout(r, 500));
+                
+                const result = await runDepthEstimation(url, setStatus);
+                if(result) {
+                    onComplete(result);
+                } else {
+                    alert("Fallo en la IA. Intenta con Chrome/Edge actualizado.");
+                    onBack();
+                }
+
+            } else {
+                // --- MODO 2: MULTI IMAGE CV ---
+                setStatus("Cargando imágenes para fotogrametría...");
+                
+                // Convertir FileList a elementos de imagen para OpenCV
+                const imgElements = await Promise.all(Array.from(inputFiles).map(file => {
+                    return new Promise(resolve => {
+                        const img = new Image();
+                        img.onload = () => resolve(img);
+                        img.src = URL.createObjectURL(file);
+                    });
+                }));
+
+                const result = await processMultiImageCV(imgElements, setStatus);
+                onComplete(result);
+            }
+        };
+        process();
+    }, [inputFiles]);
+
+    return (
+        <div className="h-safe-dvh bg-slate-950 flex flex-col items-center justify-center p-8 text-center">
+            <div className="relative w-48 h-48 mb-8">
+                {preview && <img src={preview} className="w-full h-full object-cover rounded-2xl opacity-50 border-2 border-slate-700" />}
+                <div className="absolute inset-0 flex items-center justify-center">
+                    <div className="ai-loader"></div>
+                </div>
+            </div>
             
-            <p className="absolute bottom-6 text-xs text-slate-500 text-center max-w-xs">
-                Usa "Cámara" para entornos 360° o "Subir" para modelos desde fotos existentes.
+            <h2 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-white to-slate-400 mb-2">{status}</h2>
+            <p className="text-xs text-slate-500 max-w-xs mx-auto">
+                {inputFiles.length === 1 
+                    ? "Usando 'Depth Anything' (Modelo IA de Hugging Face) corriendo localmente en tu CPU/GPU."
+                    : "Analizando paralaje y detectando puntos característicos con OpenCV."}
             </p>
         </div>
     );
 };
 
-// Pantalla 2: Cámara (UI Corregida)
-const CaptureScreen = ({ onProcess, onBack }) => {
-    const videoRef = useRef(null);
-    const canvasRef = useRef(null);
-    const [photos, setPhotos] = useState([]);
-    const [stream, setStream] = useState(null);
-
-    useEffect(() => {
-        navigator.mediaDevices.getUserMedia({ 
-            video: { 
-                facingMode: 'environment',
-                width: { ideal: 1280 }, 
-                height: { ideal: 720 }
-            } 
-        })
-        .then(s => {
-            setStream(s);
-            if(videoRef.current) videoRef.current.srcObject = s;
-        })
-        .catch(e => console.error("Sin cámara", e));
-        return () => { if(stream) stream.getTracks().forEach(t => t.stop()); }
-    }, []);
-
-    const takePhoto = () => {
-        if(!videoRef.current || !canvasRef.current) return;
-        const vid = videoRef.current;
-        const canvas = canvasRef.current;
-        canvas.width = vid.videoWidth / 2; 
-        canvas.height = vid.videoHeight / 2;
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
-        const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
-        setPhotos(prev => [...prev, dataUrl]);
-    };
-
-    return (
-        <div className="h-safe-dvh bg-black flex flex-col relative overflow-hidden">
-            <div className="flex-1 relative overflow-hidden bg-black">
-                <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover opacity-90" />
-                <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
-                     <div className="w-[70%] aspect-square border-2 border-white/30 rounded-lg relative">
-                        <div className="absolute top-0 left-0 w-6 h-6 border-t-4 border-l-4 border-emerald-400 -mt-1 -ml-1"></div>
-                        <div className="absolute top-0 right-0 w-6 h-6 border-t-4 border-r-4 border-emerald-400 -mt-1 -mr-1"></div>
-                        <div className="absolute bottom-0 left-0 w-6 h-6 border-b-4 border-l-4 border-emerald-400 -mb-1 -ml-1"></div>
-                        <div className="absolute bottom-0 right-0 w-6 h-6 border-b-4 border-r-4 border-emerald-400 -mb-1 -mr-1"></div>
-                        <div className="scanner-line opacity-50"></div>
-                    </div>
-                </div>
-            </div>
-
-            <div className="bg-slate-900/95 backdrop-blur-md pt-4 pb-12 px-6 rounded-t-3xl border-t border-slate-700 shadow-2xl z-20 shrink-0">
-                <div className="flex gap-2 overflow-x-auto mb-6 pb-2 min-h-[60px]">
-                    {photos.length === 0 && <span className="text-slate-500 text-xs w-full text-center mt-2">Las fotos aparecerán aquí</span>}
-                    {photos.map((p, i) => (
-                        <div key={i} className="relative shrink-0">
-                            <img src={p} className="w-12 h-16 object-cover rounded-lg border border-slate-500" />
-                            <div className="absolute -top-1 -right-1 bg-emerald-500 w-4 h-4 rounded-full border border-black flex items-center justify-center text-[8px] text-black font-bold">{i+1}</div>
-                        </div>
-                    ))}
-                </div>
-
-                <div className="flex items-center justify-between max-w-sm mx-auto">
-                    <button onClick={onBack} className="p-4 bg-slate-800 rounded-full text-white hover:bg-slate-700 transition">
-                        <Icon name="x" size={24} />
-                    </button>
-                    
-                    <button onClick={takePhoto} className="group relative">
-                        <div className="w-20 h-20 rounded-full border-4 border-white/30 flex items-center justify-center">
-                            <div className="w-16 h-16 bg-white rounded-full group-active:scale-90 transition-transform shadow-[0_0_20px_rgba(255,255,255,0.5)]"></div>
-                        </div>
-                    </button>
-
-                    <button 
-                        onClick={() => photos.length > 0 && onProcess(photos)} 
-                        disabled={photos.length === 0}
-                        className={`p-4 rounded-full text-white transition-all shadow-lg ${photos.length>0 ? 'bg-emerald-500 hover:bg-emerald-400 shadow-emerald-500/30' : 'bg-slate-800 opacity-30'}`}
-                    >
-                        <Icon name="arrow-right" size={24} />
-                    </button>
-                </div>
-                <p className="text-center text-slate-500 text-xs mt-4">Toma fotos girando 360° para cerrar el círculo</p>
-            </div>
-            <canvas ref={canvasRef} className="hidden" />
-        </div>
-    );
-};
-
-// Pantalla 3: Procesamiento
-const ProcessingScreen = ({ photos, onComplete }) => {
-    const [status, setStatus] = useState("Iniciando Motor...");
-    const [progress, setProgress] = useState(0);
-    const [currentImg, setCurrentImg] = useState(null);
-    const [totalPoints, setTotalPoints] = useState(0);
-    const imgRef = useRef(null);
-
-    useEffect(() => {
-        const processAll = async () => {
-            let checks = 0;
-            while(!window.cvLoaded && checks < 20) {
-                await new Promise(r => setTimeout(r, 500));
-                checks++;
-            }
-            
-            let allPoints = [];
-            for (let i = 0; i < photos.length; i++) {
-                setStatus(`Analizando Estructura (${i + 1}/${photos.length})`);
-                setCurrentImg(photos[i]);
-                setProgress(((i) / photos.length) * 100);
-                await new Promise(r => setTimeout(r, 50)); 
-                
-                if(imgRef.current) {
-                    const points = await processImageToPoints(imgRef.current, i, photos.length);
-                    setTotalPoints(prev => prev + points.length);
-                    allPoints = [...allPoints, ...points];
-                }
-            }
-            setStatus("Generando Geometría...");
-            setProgress(100);
-            setTimeout(() => onComplete(allPoints), 800);
-        };
-        processAll();
-    }, [photos]);
-
-    return (
-        <div className="h-safe-dvh bg-slate-900 text-white flex flex-col items-center justify-center p-6">
-            <div className="relative w-full max-w-sm aspect-video mb-8 bg-black rounded-xl overflow-hidden border border-slate-700 shadow-2xl ring-1 ring-emerald-500/30">
-                {currentImg && <img ref={imgRef} src={currentImg} className="w-full h-full object-contain opacity-60" crossOrigin="anonymous" />}
-                <div className="absolute inset-0 flex items-center justify-center">
-                    <div className="scanner-line"></div>
-                </div>
-            </div>
-            <h2 className="text-xl font-bold font-mono text-emerald-400 mb-2">{status}</h2>
-            <div className="w-64 h-2 bg-slate-800 rounded-full overflow-hidden mb-4">
-                <div className="h-full bg-emerald-500 transition-all duration-300" style={{width: `${progress}%`}}></div>
-            </div>
-            <div className="text-slate-400 font-mono text-sm border border-slate-700 px-4 py-2 rounded bg-slate-800/50">
-                Puntos Capturados: <span className="text-white">{totalPoints.toLocaleString()}</span>
-            </div>
-        </div>
-    );
-};
-
-// Pantalla 4: Visor Denso
-const Viewer3D = ({ pointCloudData, onReset }) => {
+// Visor 3D Universal
+const Viewer3D = ({ modelData, onReset }) => {
     const mountRef = useRef(null);
 
     useEffect(() => {
@@ -393,26 +328,71 @@ const Viewer3D = ({ pointCloudData, onReset }) => {
         const height = mountRef.current.clientHeight;
         
         const scene = new THREE.Scene();
-        scene.background = new THREE.Color(0x020617); 
+        scene.background = new THREE.Color(0x050505);
 
-        const camera = new THREE.PerspectiveCamera(70, width / height, 0.01, 100);
-        camera.position.set(0, 0, 0.1); 
+        const camera = new THREE.PerspectiveCamera(70, width / height, 0.1, 100);
+        camera.position.set(0, 0, 3);
 
-        const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
         renderer.setSize(width, height);
         mountRef.current.appendChild(renderer.domElement);
 
         const controls = new THREE.OrbitControls(camera, renderer.domElement);
         controls.enableDamping = true;
-        controls.rotateSpeed = -0.6;
-        controls.zoomSpeed = 1.2;
 
-        if(pointCloudData && pointCloudData.length > 0) {
+        // --- RENDERIZADO SEGÚN TIPO ---
+        if (modelData.type === 'mesh') {
+            // MODO MALLA (Depth Map)
+            const loader = new THREE.TextureLoader();
+            
+            // Textura Original
+            const colorMap = loader.load(modelData.originalUrl);
+            
+            // Mapa de Desplazamiento (Desde la IA)
+            // Necesitamos convertir el tensor/imagen raw de la IA a una DataTexture o Canvas
+            const depthCanvas = document.createElement('canvas');
+            depthCanvas.width = modelData.data.width;
+            depthCanvas.height = modelData.data.height;
+            const ctx = depthCanvas.getContext('2d');
+            const imgData = ctx.createImageData(modelData.data.width, modelData.data.height);
+            // Copiar datos del tensor al canvas (Escala de grises)
+            for (let i = 0; i < modelData.data.data.length; i++) {
+                const val = modelData.data.data[i]; // Valor 0-255 (aprox)
+                imgData.data[i*4] = val;     // R
+                imgData.data[i*4+1] = val;   // G
+                imgData.data[i*4+2] = val;   // B
+                imgData.data[i*4+3] = 255;   // Alpha
+            }
+            ctx.putImageData(imgData, 0, 0);
+            
+            const displacementMap = new THREE.CanvasTexture(depthCanvas);
+
+            // Crear Plano con muchos segmentos para el relieve
+            const geometry = new THREE.PlaneGeometry(4, 3, 256, 256); // Alta resolución
+            const material = new THREE.MeshStandardMaterial({
+                map: colorMap,
+                displacementMap: displacementMap,
+                displacementScale: 1.5, // Cuánto "sale" la imagen
+                side: THREE.DoubleSide
+            });
+            
+            const mesh = new THREE.Mesh(geometry, material);
+            scene.add(mesh);
+
+            // Iluminación para que se note el relieve
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+            scene.add(ambientLight);
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+            dirLight.position.set(2, 2, 5);
+            scene.add(dirLight);
+
+        } else if (modelData.type === 'cloud') {
+            // MODO NUBE DE PUNTOS
             const geometry = new THREE.BufferGeometry();
             const positions = [];
             const colors = [];
 
-            pointCloudData.forEach(pt => {
+            modelData.points.forEach(pt => {
                 positions.push(...pt.pos);
                 colors.push(...pt.color);
             });
@@ -420,16 +400,14 @@ const Viewer3D = ({ pointCloudData, onReset }) => {
             geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
             geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
 
-            const material = new THREE.PointsMaterial({ 
-                size: 0.05, 
-                vertexColors: true,
-                sizeAttenuation: true,
-                transparent: true,
-                opacity: 0.85
-            });
-
-            const particles = new THREE.Points(geometry, material);
-            scene.add(particles);
+            const material = new THREE.PointsMaterial({ size: 0.04, vertexColors: true });
+            const cloud = new THREE.Points(geometry, material);
+            scene.add(cloud);
+            
+            // Grid de suelo
+            const grid = new THREE.GridHelper(10, 10, 0x333333, 0x111111);
+            grid.position.y = -2;
+            scene.add(grid);
         }
 
         const animate = () => {
@@ -440,28 +418,65 @@ const Viewer3D = ({ pointCloudData, onReset }) => {
         animate();
 
         return () => { if(mountRef.current) mountRef.current.innerHTML = ''; };
-    }, [pointCloudData]);
+    }, [modelData]);
 
     return (
-        <div className="h-safe-dvh relative bg-black">
-            <div ref={mountRef} className="w-full h-full cursor-move" />
+        <div className="h-safe-dvh relative">
+            <div ref={mountRef} className="w-full h-full cursor-move bg-gradient-to-b from-slate-900 to-black" />
             
-            <div className="absolute top-4 left-4 right-4 flex justify-between items-start pointer-events-none">
-                <div className="bg-black/60 backdrop-blur px-4 py-2 rounded-lg border border-white/10 flex items-center gap-2">
-                    <div className="flex flex-col">
-                        <h1 className="font-bold text-white text-sm">Modelo Generado</h1>
-                        <p className="text-[10px] text-emerald-400">{pointCloudData.length} Puntos</p>
-                    </div>
-                </div>
-                <div className="bg-slate-800/80 px-2 py-1 rounded border border-slate-600">
-                    <span className="text-[10px] text-slate-300 font-mono">v{APP_VERSION}</span>
+            <div className="absolute bottom-8 left-0 w-full flex justify-center pointer-events-none">
+                <div className="bg-slate-900/80 backdrop-blur border border-slate-700 p-4 rounded-2xl flex flex-col items-center gap-2 pointer-events-auto">
+                    <span className="text-xs font-bold text-emerald-400 uppercase tracking-widest">
+                        {modelData.type === 'mesh' ? 'Modelo Generativo IA' : 'Nube de Puntos CV'}
+                    </span>
+                    <button onClick={onReset} className="bg-white text-black px-6 py-2 rounded-full font-bold hover:bg-slate-200 transition">
+                        Nuevo Escaneo
+                    </button>
                 </div>
             </div>
+        </div>
+    );
+};
+
+// Cámara Simple (Solo pass-through a Processing)
+const CameraCapture = ({ onCapture, onBack }) => {
+    const videoRef = useRef(null);
+    const [photos, setPhotos] = useState([]);
+
+    useEffect(() => {
+        navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+            .then(s => { if(videoRef.current) videoRef.current.srcObject = s; })
+            .catch(e => console.error(e));
+    }, []);
+
+    const takePhoto = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = videoRef.current.videoWidth;
+        canvas.height = videoRef.current.videoHeight;
+        canvas.getContext('2d').drawImage(videoRef.current, 0,0);
+        
+        canvas.toBlob(blob => {
+            const file = new File([blob], "capture.jpg", { type: "image/jpeg" });
+            setPhotos(p => [...p, file]);
+        }, 'image/jpeg');
+    };
+
+    return (
+        <div className="h-safe-dvh bg-black relative flex flex-col">
+            <video ref={videoRef} autoPlay playsInline muted className="flex-1 object-cover" />
             
-            <div className="absolute bottom-10 w-full flex justify-center pointer-events-none">
-                <button onClick={onReset} className="bg-emerald-600 hover:bg-emerald-500 text-white px-6 py-3 rounded-full shadow-lg pointer-events-auto transition font-bold text-sm flex items-center gap-2">
-                    <Icon name="refresh-cw" size={16} /> NUEVO ESCANEO
-                </button>
+            {/* UI Superpuesta */}
+            <div className="absolute bottom-0 w-full p-6 bg-gradient-to-t from-black via-black/80 to-transparent flex flex-col items-center gap-4">
+                <div className="flex gap-2 overflow-x-auto w-full h-16 px-4">
+                     {photos.map((p,i) => <img key={i} src={URL.createObjectURL(p)} className="h-full rounded border border-white" />)}
+                </div>
+                
+                <div className="flex items-center gap-8">
+                    <button onClick={onBack} className="p-4 rounded-full bg-slate-800 text-white"><Icon name="x"/></button>
+                    <button onClick={takePhoto} className="w-20 h-20 rounded-full border-4 border-white flex items-center justify-center"><div className="w-16 h-16 bg-white rounded-full active:scale-90 transition"/></button>
+                    <button onClick={() => photos.length > 0 && onCapture(photos)} className="p-4 rounded-full bg-emerald-500 text-black font-bold"><Icon name="check"/></button>
+                </div>
+                <p className="text-xs text-slate-400">Toma varias fotos para modo Nube de Puntos</p>
             </div>
         </div>
     );
@@ -469,23 +484,34 @@ const Viewer3D = ({ pointCloudData, onReset }) => {
 
 const App = () => {
     const [step, setStep] = useState('home');
-    const [capturedPhotos, setCapturedPhotos] = useState([]);
-    const [points, setPoints] = useState([]);
+    const [files, setFiles] = useState([]);
+    const [model, setModel] = useState(null);
 
     return (
         <>
             {step === 'home' && (
                 <HomeScreen 
-                    onStartCamera={() => setStep('capture')} 
-                    onUpload={(photos) => {
-                        setCapturedPhotos(photos);
-                        setStep('process');
-                    }}
+                    onStartCamera={() => setStep('camera')}
+                    onUpload={(f) => { setFiles(f); setStep('process'); }}
                 />
             )}
-            {step === 'capture' && <CaptureScreen onBack={() => setStep('home')} onProcess={(p) => { setCapturedPhotos(p); setStep('process'); }} />}
-            {step === 'process' && <ProcessingScreen photos={capturedPhotos} onComplete={(d) => { setPoints(d); setStep('view'); }} />}
-            {step === 'view' && <Viewer3D pointCloudData={points} onReset={() => setStep('home')} />}
+            
+            {step === 'camera' && (
+                <CameraCapture 
+                    onBack={() => setStep('home')}
+                    onCapture={(f) => { setFiles(f); setStep('process'); }}
+                />
+            )}
+
+            {step === 'process' && (
+                <ProcessingScreen 
+                    inputFiles={files} 
+                    onBack={() => setStep('home')}
+                    onComplete={(m) => { setModel(m); setStep('view'); }}
+                />
+            )}
+
+            {step === 'view' && <Viewer3D modelData={model} onReset={() => setStep('home')} />}
         </>
     );
 };
