@@ -88,7 +88,7 @@
 <script type="text/babel">
 
 const { useState, useEffect, useRef } = React;
-const APP_VERSION = "1.02";
+const APP_VERSION = "1.03";
 
 // --- UTILS: IA & Computer Vision ---
 
@@ -98,12 +98,22 @@ const runDepthEstimation = async (imageUrl, updateStatus) => {
     try {
         updateStatus("Cargando Motor Neural (30MB)...");
         
-        // Importación Dinámica de la librería de IA
-        const { pipeline, env } = await import('https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/dist/transformers.min.js');
+        // CORRECCIÓN CRÍTICA: Importación segura y configuración de rutas WASM para GitHub Pages
+        const Transformers = await import('https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2');
         
-        // Configuración para forzar descarga remota la primera vez
-        env.allowLocalModels = false;
-        env.useBrowserCache = true;
+        // Manejar exportación por defecto o nombrada (Compatibilidad UMD/ESM)
+        const pipeline = Transformers.pipeline || Transformers.default?.pipeline;
+        const env = Transformers.env || Transformers.default?.env;
+
+        if (!pipeline || !env) throw new Error("No se pudo inicializar la librería Transformers.js");
+
+        // CONFIGURACIÓN OBLIGATORIA PARA ENTORNOS WEB/GITHUB PAGES
+        env.allowLocalModels = false; // No buscar modelos en local
+        env.useBrowserCache = true;   // Usar caché para no descargar siempre
+        
+        // IMPORTANTE: Forzar la ruta de los binarios WASM al CDN global
+        // Esto soluciona el error de "404 Not Found" en archivos .wasm
+        env.backends.onnx.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/';
 
         // Cargar modelo 'Depth Anything' (Versión pequeña optimizada para web)
         const depther = await pipeline('depth-estimation', 'Xenova/depth-anything-small-hf', {
@@ -121,8 +131,9 @@ const runDepthEstimation = async (imageUrl, updateStatus) => {
         return { type: 'mesh', data: result.depth, originalUrl: imageUrl };
 
     } catch (e) {
-        console.error("Error IA:", e);
-        updateStatus("Error: Navegador no soporta WebGPU/WASM.");
+        console.error("Error Detallado IA:", e);
+        // Mostrar error real en pantalla para depuración
+        updateStatus(`Error IA: ${e.message || "Fallo desconocido"}`);
         return null;
     }
 };
@@ -275,8 +286,8 @@ const ProcessingScreen = ({ inputFiles, onComplete, onBack }) => {
                 if(result) {
                     onComplete(result);
                 } else {
-                    alert("Fallo en la IA. Intenta con Chrome/Edge actualizado.");
-                    onBack();
+                    // No hacemos onBack automatico para que el usuario pueda leer el error
+                    console.warn("Proceso detenido por error en IA");
                 }
 
             } else {
@@ -304,12 +315,24 @@ const ProcessingScreen = ({ inputFiles, onComplete, onBack }) => {
             <div className="relative w-48 h-48 mb-8">
                 {preview && <img src={preview} className="w-full h-full object-cover rounded-2xl opacity-50 border-2 border-slate-700" />}
                 <div className="absolute inset-0 flex items-center justify-center">
-                    <div className="ai-loader"></div>
+                    {/* Si hay error (contiene "Error"), mostramos icono de alerta en vez de loader */}
+                    {status.includes("Error") ? (
+                         <Icon name="alert-triangle" size={48} className="text-red-500" />
+                    ) : (
+                        <div className="ai-loader"></div>
+                    )}
                 </div>
             </div>
             
-            <h2 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-white to-slate-400 mb-2">{status}</h2>
-            <p className="text-xs text-slate-500 max-w-xs mx-auto">
+            <h2 className={`text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r ${status.includes("Error") ? 'from-red-400 to-red-600' : 'from-white to-slate-400'} mb-2`}>{status}</h2>
+            
+            {status.includes("Error") && (
+                <button onClick={onBack} className="mt-4 px-6 py-2 bg-slate-800 hover:bg-slate-700 rounded-full text-white text-sm transition">
+                    Volver e Intentar de Nuevo
+                </button>
+            )}
+
+            <p className="text-xs text-slate-500 max-w-xs mx-auto mt-4">
                 {inputFiles.length === 1 
                     ? "Usando 'Depth Anything' (Modelo IA de Hugging Face) corriendo localmente en tu CPU/GPU."
                     : "Analizando paralaje y detectando puntos característicos con OpenCV."}
