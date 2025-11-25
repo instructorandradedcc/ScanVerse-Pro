@@ -61,6 +61,7 @@
 <script type="text/babel">
 
 const { useState, useEffect, useRef } = React;
+const APP_VERSION = "1.01";
 
 // --- UTILS: Computer Vision Mejorado ---
 
@@ -85,41 +86,61 @@ const processImageToPoints = async (imgElement, index, totalImages) => {
         const height = src.rows;
         const points = [];
         
-        // --- 1. Muestreo de Cuadrícula (Para rellenar paredes vacías) ---
-        // Esto soluciona que el modelo se vea vacío. Escaneamos "todo" cada X pixeles.
-        const gridStep = 12; // Muestra un punto cada 12 pixeles (ajustar para densidad vs rendimiento)
+        // --- LÓGICA DE PROYECCIÓN ADAPTATIVA ---
+        // Si es 1 foto: Proyección Cónica (90 grados) para perspectiva
+        // Si son varias: Proyección Cilíndrica (360 grados) para entorno
+        const isSingleImage = totalImages === 1;
         
-        // Calcular geometría base
-        const anglePerImage = (Math.PI * 2) / totalImages;
-        const baseAngle = index * anglePerImage;
-        const radius = 4.5; // Radio un poco más amplio
+        // Radio de proyección
+        const radius = 4.5; 
 
-        // Función auxiliar para agregar punto
+        // Función auxiliar para calcular posición 3D
+        const calculate3DPos = (u, v) => {
+            let theta, h;
+            
+            if (isSingleImage) {
+                // Modo Foto Única: Proyectar en un arco de 90 grados frente al usuario
+                const fov = Math.PI / 2; // 90 grados
+                // Centrar el ángulo: u va de 0 a 1 -> mapear a -45 a +45 grados
+                theta = (u - 0.5) * fov + Math.PI; 
+                
+                // Altura estándar
+                h = -(v - 0.5) * 4;
+            } else {
+                // Modo Panorama: Cilindro completo 360
+                const anglePerImage = (Math.PI * 2) / totalImages;
+                const baseAngle = index * anglePerImage;
+                // FOV por imagen (asumimos solapamiento, aprox 60 grados por foto)
+                const imageFov = Math.PI / 2.5; 
+                
+                theta = baseAngle - (u * imageFov) + Math.PI;
+                h = -(v - 0.5) * 4;
+            }
+
+            const pX = radius * Math.sin(theta);
+            const pZ = radius * Math.cos(theta);
+            const pY = h;
+            
+            return { x: pX, y: pY, z: pZ };
+        };
+
+        const gridStep = 12; // Muestreo denso
         const addPoint = (x, y, r, g, b) => {
-             // Mapeo Cilíndrico
              const u = x / width; 
-             // Ajuste de FOV: Asumimos que la cámara ve unos 60 grados (PI/3)
-             // El "- u" invierte el barrido para coincidir con la rotación
-             const theta = baseAngle - (u * (Math.PI / 2.5)) + Math.PI; 
+             const v = y / height;
+             
+             const pos = calculate3DPos(u, v);
 
-             const v = (y / height) - 0.5;
-             const h = -v * 4; // Altura escalada
-
-             const pX = radius * Math.sin(theta);
-             const pZ = radius * Math.cos(theta);
-             const pY = h;
-
-             // Añadimos un poco de "ruido" de profundidad aleatorio para que no parezca un papel plano perfecto
-             // Esto le da volumen a las superficies irregulares
-             const depthNoise = (Math.random() - 0.5) * 0.1; 
+             // Ruido de profundidad para dar textura 3D
+             const depthNoise = (Math.random() - 0.5) * 0.15; 
 
              points.push({
-                pos: [pX * (1 + depthNoise), pY, pZ * (1 + depthNoise)],
+                pos: [pos.x * (1 + depthNoise), pos.y, pos.z * (1 + depthNoise)],
                 color: [r/255, g/255, b/255]
              });
         };
 
-        // Bucle Denso (Relleno)
+        // 1. Muestreo Regular (Grid)
         for (let y = 0; y < height; y += gridStep) {
             for (let x = 0; x < width; x += gridStep) {
                 const pixel = src.ucharPtr(y, x);
@@ -127,11 +148,10 @@ const processImageToPoints = async (imgElement, index, totalImages) => {
             }
         }
 
-        // --- 2. Detección de Detalles (ORB) ---
-        // Añadimos puntos extra donde haya bordes reales para definir mejor los objetos
+        // 2. Detección de Detalles (ORB) para bordes nítidos
         const gray = new cv.Mat();
         cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
-        const orb = new cv.ORB(1500); // Aumentado de 500 a 1500
+        const orb = new cv.ORB(1500); 
         const keypoints = new cv.KeyPointVector();
         const descriptors = new cv.Mat();
         orb.detectAndCompute(gray, new cv.Mat(), keypoints, descriptors);
@@ -146,7 +166,6 @@ const processImageToPoints = async (imgElement, index, totalImages) => {
             }
         }
 
-        // Limpieza
         src.delete(); gray.delete(); orb.delete(); keypoints.delete(); descriptors.delete();
         resolve(points);
     });
@@ -157,22 +176,70 @@ const Icon = ({ name, size = 24, className }) => {
     return <i data-lucide={name} width={size} height={size} className={className}></i>;
 };
 
-// Pantalla 1: Inicio
-const HomeScreen = ({ onStart }) => (
-    <div className="h-safe-dvh w-full flex flex-col items-center justify-center bg-slate-900 text-white p-6 relative overflow-hidden">
-        <div className="absolute inset-0 lidar-grid opacity-20 pointer-events-none"></div>
-        <div className="z-10 text-center max-w-md">
-            <div className="w-24 h-24 bg-emerald-500/10 rounded-full flex items-center justify-center ring-1 ring-emerald-500/50 mx-auto mb-6">
-                <Icon name="scan-face" size={48} className="text-emerald-400" />
+// Pantalla 1: Inicio (Modificada con Versión y Upload)
+const HomeScreen = ({ onStartCamera, onUpload }) => {
+    const fileInputRef = useRef(null);
+
+    const handleFileSelect = (e) => {
+        const files = Array.from(e.target.files);
+        if (files.length > 0) {
+            // Convertir archivos a Data URLs
+            Promise.all(files.map(file => new Promise((resolve) => {
+                const reader = new FileReader();
+                reader.onload = (e) => resolve(e.target.result);
+                reader.readAsDataURL(file);
+            }))).then(images => {
+                onUpload(images);
+            });
+        }
+    };
+
+    return (
+        <div className="h-safe-dvh w-full flex flex-col items-center justify-center bg-slate-900 text-white p-6 relative overflow-hidden">
+            <div className="absolute inset-0 lidar-grid opacity-20 pointer-events-none"></div>
+            
+            {/* Versión Badge */}
+            <div className="absolute top-4 right-4 bg-slate-800/50 backdrop-blur px-3 py-1 rounded-full border border-slate-700">
+                <span className="text-xs font-mono text-emerald-400">v{APP_VERSION}</span>
             </div>
-            <h1 className="text-4xl font-bold mb-2 bg-clip-text text-transparent bg-gradient-to-r from-emerald-400 to-blue-500">ScanVerse Pro</h1>
-            <p className="text-slate-400 mb-8 text-sm">Escaneo Denso Híbrido.<br/>Captura paredes y detalles completos.</p>
-            <button onClick={onStart} className="w-full py-4 bg-emerald-600 hover:bg-emerald-500 rounded-xl font-bold shadow-lg shadow-emerald-900/50 transition flex items-center justify-center gap-2">
-                <Icon name="camera" size={20} /> INICIAR ESCANEO
-            </button>
+
+            <div className="z-10 text-center max-w-md w-full">
+                <div className="w-24 h-24 bg-emerald-500/10 rounded-full flex items-center justify-center ring-1 ring-emerald-500/50 mx-auto mb-6">
+                    <Icon name="scan-face" size={48} className="text-emerald-400" />
+                </div>
+                <h1 className="text-4xl font-bold mb-2 bg-clip-text text-transparent bg-gradient-to-r from-emerald-400 to-blue-500">ScanVerse Pro</h1>
+                <p className="text-slate-400 mb-8 text-sm">Escaneo Denso Híbrido & Modelado 3D.<br/>Captura paredes o visualiza planos.</p>
+                
+                <div className="space-y-3 w-full">
+                    <button onClick={onStartCamera} className="w-full py-4 bg-emerald-600 hover:bg-emerald-500 rounded-xl font-bold shadow-lg shadow-emerald-900/50 transition flex items-center justify-center gap-2">
+                        <Icon name="camera" size={20} /> INICIAR CÁMARA
+                    </button>
+                    
+                    <div className="relative">
+                        <input 
+                            type="file" 
+                            multiple 
+                            accept="image/*" 
+                            ref={fileInputRef} 
+                            onChange={handleFileSelect}
+                            className="hidden" 
+                        />
+                        <button 
+                            onClick={() => fileInputRef.current.click()}
+                            className="w-full py-4 bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded-xl font-semibold transition flex items-center justify-center gap-2"
+                        >
+                            <Icon name="upload" size={20} /> SUBIR IMAGEN / FOTOS
+                        </button>
+                    </div>
+                </div>
+            </div>
+            
+            <p className="absolute bottom-6 text-xs text-slate-500 text-center max-w-xs">
+                Usa "Cámara" para entornos 360° o "Subir" para modelos desde fotos existentes.
+            </p>
         </div>
-    </div>
-);
+    );
+};
 
 // Pantalla 2: Cámara (UI Corregida)
 const CaptureScreen = ({ onProcess, onBack }) => {
@@ -182,11 +249,10 @@ const CaptureScreen = ({ onProcess, onBack }) => {
     const [stream, setStream] = useState(null);
 
     useEffect(() => {
-        // Pedir camara con resolución ideal
         navigator.mediaDevices.getUserMedia({ 
             video: { 
                 facingMode: 'environment',
-                width: { ideal: 1280 }, // Mejor calidad
+                width: { ideal: 1280 }, 
                 height: { ideal: 720 }
             } 
         })
@@ -202,7 +268,6 @@ const CaptureScreen = ({ onProcess, onBack }) => {
         if(!videoRef.current || !canvasRef.current) return;
         const vid = videoRef.current;
         const canvas = canvasRef.current;
-        // Capturar a resolución media para no explotar la memoria
         canvas.width = vid.videoWidth / 2; 
         canvas.height = vid.videoHeight / 2;
         const ctx = canvas.getContext('2d');
@@ -212,14 +277,9 @@ const CaptureScreen = ({ onProcess, onBack }) => {
     };
 
     return (
-        // Usamos h-safe-dvh para asegurar altura correcta en movil
         <div className="h-safe-dvh bg-black flex flex-col relative overflow-hidden">
-            
-            {/* Visor de Video (Ocupa todo el espacio disponible menos controles) */}
             <div className="flex-1 relative overflow-hidden bg-black">
                 <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover opacity-90" />
-                
-                {/* Guía Visual */}
                 <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
                      <div className="w-[70%] aspect-square border-2 border-white/30 rounded-lg relative">
                         <div className="absolute top-0 left-0 w-6 h-6 border-t-4 border-l-4 border-emerald-400 -mt-1 -ml-1"></div>
@@ -231,10 +291,7 @@ const CaptureScreen = ({ onProcess, onBack }) => {
                 </div>
             </div>
 
-            {/* Controles UI - Con padding extra bottom (pb-8/pb-12) para evitar la barra del sistema */}
             <div className="bg-slate-900/95 backdrop-blur-md pt-4 pb-12 px-6 rounded-t-3xl border-t border-slate-700 shadow-2xl z-20 shrink-0">
-                
-                {/* Thumbnails */}
                 <div className="flex gap-2 overflow-x-auto mb-6 pb-2 min-h-[60px]">
                     {photos.length === 0 && <span className="text-slate-500 text-xs w-full text-center mt-2">Las fotos aparecerán aquí</span>}
                     {photos.map((p, i) => (
@@ -245,7 +302,6 @@ const CaptureScreen = ({ onProcess, onBack }) => {
                     ))}
                 </div>
 
-                {/* Botonera Principal - Elevada */}
                 <div className="flex items-center justify-between max-w-sm mx-auto">
                     <button onClick={onBack} className="p-4 bg-slate-800 rounded-full text-white hover:bg-slate-700 transition">
                         <Icon name="x" size={24} />
@@ -265,10 +321,8 @@ const CaptureScreen = ({ onProcess, onBack }) => {
                         <Icon name="arrow-right" size={24} />
                     </button>
                 </div>
-                
                 <p className="text-center text-slate-500 text-xs mt-4">Toma fotos girando 360° para cerrar el círculo</p>
             </div>
-            
             <canvas ref={canvasRef} className="hidden" />
         </div>
     );
@@ -292,7 +346,7 @@ const ProcessingScreen = ({ photos, onComplete }) => {
             
             let allPoints = [];
             for (let i = 0; i < photos.length; i++) {
-                setStatus(`Escaneando Superficies (${i + 1}/${photos.length})`);
+                setStatus(`Analizando Estructura (${i + 1}/${photos.length})`);
                 setCurrentImg(photos[i]);
                 setProgress(((i) / photos.length) * 100);
                 await new Promise(r => setTimeout(r, 50)); 
@@ -303,7 +357,7 @@ const ProcessingScreen = ({ photos, onComplete }) => {
                     allPoints = [...allPoints, ...points];
                 }
             }
-            setStatus("Finalizando Modelo Denso...");
+            setStatus("Generando Geometría...");
             setProgress(100);
             setTimeout(() => onComplete(allPoints), 800);
         };
@@ -339,7 +393,7 @@ const Viewer3D = ({ pointCloudData, onReset }) => {
         const height = mountRef.current.clientHeight;
         
         const scene = new THREE.Scene();
-        scene.background = new THREE.Color(0x020617); // Slate 950 muy oscuro
+        scene.background = new THREE.Color(0x020617); 
 
         const camera = new THREE.PerspectiveCamera(70, width / height, 0.01, 100);
         camera.position.set(0, 0, 0.1); 
@@ -366,7 +420,6 @@ const Viewer3D = ({ pointCloudData, onReset }) => {
             geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
             geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
 
-            // Puntos un poco más grandes y densos para que parezca sólido
             const material = new THREE.PointsMaterial({ 
                 size: 0.05, 
                 vertexColors: true,
@@ -394,9 +447,14 @@ const Viewer3D = ({ pointCloudData, onReset }) => {
             <div ref={mountRef} className="w-full h-full cursor-move" />
             
             <div className="absolute top-4 left-4 right-4 flex justify-between items-start pointer-events-none">
-                <div className="bg-black/60 backdrop-blur px-4 py-2 rounded-lg border border-white/10">
-                    <h1 className="font-bold text-white text-sm">Modelo Generado</h1>
-                    <p className="text-[10px] text-emerald-400">Alta Densidad ({pointCloudData.length} pts)</p>
+                <div className="bg-black/60 backdrop-blur px-4 py-2 rounded-lg border border-white/10 flex items-center gap-2">
+                    <div className="flex flex-col">
+                        <h1 className="font-bold text-white text-sm">Modelo Generado</h1>
+                        <p className="text-[10px] text-emerald-400">{pointCloudData.length} Puntos</p>
+                    </div>
+                </div>
+                <div className="bg-slate-800/80 px-2 py-1 rounded border border-slate-600">
+                    <span className="text-[10px] text-slate-300 font-mono">v{APP_VERSION}</span>
                 </div>
             </div>
             
@@ -416,7 +474,15 @@ const App = () => {
 
     return (
         <>
-            {step === 'home' && <HomeScreen onStart={() => setStep('capture')} />}
+            {step === 'home' && (
+                <HomeScreen 
+                    onStartCamera={() => setStep('capture')} 
+                    onUpload={(photos) => {
+                        setCapturedPhotos(photos);
+                        setStep('process');
+                    }}
+                />
+            )}
             {step === 'capture' && <CaptureScreen onBack={() => setStep('home')} onProcess={(p) => { setCapturedPhotos(p); setStep('process'); }} />}
             {step === 'process' && <ProcessingScreen photos={capturedPhotos} onComplete={(d) => { setPoints(d); setStep('view'); }} />}
             {step === 'view' && <Viewer3D pointCloudData={points} onReset={() => setStep('home')} />}
